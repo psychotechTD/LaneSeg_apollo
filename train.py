@@ -1,12 +1,13 @@
 import argparse
 import os
 import numpy as np
+import time
 from tqdm import tqdm
 
-from dataloaders import make_data_loader, make_data_loader2
+from dataloaders import make_data_loader
 from modeling.sync_batchnorm.replicate import patch_replication_callback
 from modeling.deeplab import *
-from utils.loss import SegmentationLosses
+from utils.loss import SegmentationLosses, make_one_hot
 from utils.lr_scheduler import LR_Scheduler
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
@@ -44,6 +45,8 @@ class Trainer(object):
 
         # Define Criterion
         self.criterion = SegmentationLosses(weight=None, cuda=args.cuda).build_loss(mode=args.loss_type)
+        self.criterion1 = SegmentationLosses(weight=None, cuda=args.cuda).build_loss(mode='ce')
+        self.criterion2 = SegmentationLosses(weight=None, cuda=args.cuda).build_loss(mode='dice')
         self.model, self.optimizer = model, optimizer
         
         # Define Evaluator
@@ -83,6 +86,7 @@ class Trainer(object):
 
     def training(self, epoch):
         train_loss = 0.0
+        prev_time = time.time()
         self.model.train()
         self.evaluator.reset()
         tbar = tqdm(self.train_loader)
@@ -95,11 +99,21 @@ class Trainer(object):
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
             self.optimizer.zero_grad()
             output = self.model(image)
-            loss = self.criterion(output, target)
+            if self.args.loss_type == 'diceplusce':
+                loss1 = self.criterion1(output, target)
+                loss2 = self.criterion2(output, make_one_hot(target.long(), num_classes=self.nclass))
+                loss = loss1 + loss2
+            else:
+                loss = self.criterion(output, target)
             loss.backward()
             self.optimizer.step()
             train_loss += loss.item()
-            tbar.set_description('Train loss: %.3f' % (train_loss / (i + 1)))
+
+            # Show 10 * 3 inference results each epoch
+            if i % (num_img_tr // 10) == 0:
+                global_step = i + num_img_tr * epoch
+                self.summary.visualize_image(self.writer, self.args.dataset, image, target, output, global_step)
+
             self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
             pred = output.data.cpu().numpy()
             target = target.cpu().numpy()
@@ -107,17 +121,23 @@ class Trainer(object):
             # Add batch sample into evaluator
             self.evaluator.add_batch(target, pred)
 
-            # Show 10 * 3 inference results each epoch
-            if i % (num_img_tr // 10) == 0:
-                global_step = i + num_img_tr * epoch
-                self.summary.visualize_image(self.writer, self.args.dataset, image, target, output, global_step)
+
+            if self.args.loss_type == 'diceplusce':
+                end_time = time.time()
+                tbar.set_description('val loss: %.3f, celoss: %.4f, diceloss: %.4f, time cost: %.3f s' \
+                                     % (train_loss / (i + 1), loss1.item(), loss2.item(), end_time - prev_time))
+            else:
+                tbar.set_description('Train loss: %.3f' % (train_loss / (i + 1)))
+
+
 
         # train evaluate
         Acc = self.evaluator.Pixel_Accuracy()
         Acc_class = self.evaluator.Pixel_Accuracy_Class()
-        mIoU = self.evaluator.Mean_Intersection_over_Union()
+        IoU = self.evaluator.Mean_Intersection_over_Union()
+        mIoU = np.nanmean(IoU)
         FWIoU = self.evaluator.Frequency_Weighted_Intersection_over_Union()
-        print("Acc:{}, Acc_class:{}, mIoU:{}, fwIoU: {}".format(Acc, Acc_class, mIoU, FWIoU))
+        print("Acc_tr:{}, Acc_class_tr:{}, IoU_tr:{}, mIoU_tr:{}, fwIoU_tr: {}".format(Acc, Acc_class, IoU, mIoU, FWIoU))
 
         self.writer.add_scalar('train/total_loss_epoch', train_loss, epoch)
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
@@ -138,16 +158,29 @@ class Trainer(object):
         self.model.eval()
         self.evaluator.reset()
         tbar = tqdm(self.val_loader, desc='\r')
-        test_loss = 0.0
+        val_loss = 0.0
+        prev_time = time.time()
         for i, sample in enumerate(tbar):
             image, target = sample['image'], sample['label']
             if self.args.cuda:
                 image, target = image.cuda(), target.cuda()
             with torch.no_grad(): #
                 output = self.model(image)
-            loss = self.criterion(output, target)
-            test_loss += loss.item()
-            tbar.set_description('Test loss: %.3f' % (test_loss / (i + 1)))
+            if self.args.loss_type == 'diceplusce':
+                loss1 = self.criterion1(output, target)
+                loss2 = self.criterion2(output, make_one_hot(target.long(), num_classes=self.nclass))
+                loss = loss1 + loss2
+            else:
+                loss = self.criterion(output, target)
+            val_loss += loss.item()
+
+
+            if self.args.loss_type == 'diceplusce':
+                tbar.set_description('val loss: %.3f, celoss: %.4f, diceloss: %.4f, time cost: %.3f s' \
+                                     % (val_loss / (i + 1), loss1.item(), loss2.item(), end_time - prev_time))
+            else:
+                tbar.set_description('val loss: %.3f' % (val_loss / (i + 1)))
+
             pred = output.data.cpu().numpy()
             target = target.cpu().numpy()
             pred = np.argmax(pred, axis=1)
@@ -157,9 +190,10 @@ class Trainer(object):
         # Fast test during the training
         Acc = self.evaluator.Pixel_Accuracy()
         Acc_class = self.evaluator.Pixel_Accuracy_Class()
-        mIoU = self.evaluator.Mean_Intersection_over_Union()
+        IoU = self.evaluator.Mean_Intersection_over_Union()
+        mIoU = np.nanmean(IoU)
         FWIoU = self.evaluator.Frequency_Weighted_Intersection_over_Union()
-        self.writer.add_scalar('val/total_loss_epoch', test_loss, epoch)
+        self.writer.add_scalar('val/total_loss_epoch', val_loss, epoch)
         self.writer.add_scalar('val/mIoU', mIoU, epoch)
         self.writer.add_scalar('val/Acc', Acc, epoch)
         self.writer.add_scalar('val/Acc_class', Acc_class, epoch)
@@ -167,7 +201,7 @@ class Trainer(object):
         print('Validation:')
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
         print("Acc:{}, Acc_class:{}, mIoU:{}, fwIoU: {}".format(Acc, Acc_class, mIoU, FWIoU))
-        print('Loss: %.3f' % test_loss)
+        print('Loss: %.3f' % val_loss)
 
         new_pred = mIoU
         if new_pred > self.best_pred:

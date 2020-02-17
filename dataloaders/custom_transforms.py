@@ -36,8 +36,8 @@ class Normalize(object):
     def __call__(self, sample):
         img = sample['image']
         mask = sample['label']
-        # img = np.array(img).astype(np.float32)
-        # mask = np.array(mask).astype(np.float32)
+        img = np.array(img).astype(np.float32)
+        mask = np.array(mask).astype(np.float32)
         img = img / 255.0
         img = img - self.mean
         img = img / self.std
@@ -58,8 +58,8 @@ class ToTensor(object):
         img = np.array(img).astype(np.float32).transpose((2, 0, 1))
         mask = np.array(mask).astype(np.float32)
 
-        # img = torch.from_numpy(img).float()
-        # mask = torch.from_numpy(mask).float()
+        img = torch.from_numpy(img).float()
+        mask = torch.from_numpy(mask).float()
 
         return {'image': img,
                 'label': mask}
@@ -70,10 +70,10 @@ class RandomHorizontalFlip(object):
         img = sample['image']
         mask = sample['label']
         if random.random() < 0.5:
-            # img = img.transpose(Image.FLIP_LEFT_RIGHT)
-            # mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
-            img = cv2.flip(img, 1)
-            mask = cv2.flip(mask, 1)
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+            # img = cv2.flip(img, 1)
+            # mask = cv2.flip(mask, 1)
 
         return {'image': img,
                 'label': mask}
